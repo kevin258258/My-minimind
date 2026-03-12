@@ -70,3 +70,24 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+import torch
+import torch.nn as nn
+# 现在我们先来编写数据整理的RMSnorm，当然，作为layer我们要继承一个module类
+class RMSNorm(nn.Module):
+        #这里我们需要编写初始化，forward等方法
+        def __init__(self,dim:int , eps:float = 1e-5):
+             super().__init__()
+             self.dim =dim
+             self.eps =eps
+             self.weight = nn.Parameter(torch.ones(dim))
+
+        # norm
+        def _norm(self,x):
+             return torch.rsqrt(x.pow(2).mean(dim = -1,keepdim = True) +self. eps)
+        
+        # forward
+        def _forward(self,x):
+             return self.weight * self._norm(x.float()).type_as(x)  * x
+        
+        
