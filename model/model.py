@@ -1,5 +1,5 @@
 from transformers import PretrainedConfig
-from typing import Optional
+from typing import Optional,Tuple
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -82,6 +82,7 @@ from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 # 现在我们先来编写数据整理的RMSnorm，当然，作为layer我们要继承一个module类
+#另外这里统一一下，向量统一形状都是B H S D，B是batch_size，H是head数量，S是序列长度，D是每个head的维度
 class RMSNorm(nn.Module):
         #这里我们需要编写初始化，forward等方法
         def __init__(self,dim:int , eps:float = 1e-5):
@@ -169,3 +170,102 @@ def  apply_rope(cos,sin,Q,K,position_ids = None,unsqueeze_dim = 1):
     k_embed = K * cos + rotate_half(K) * sin
 
     return q_embed,k_embed
+
+#repeat_kv 的作用是将 K 和 V 在 heads 维度上进行“广播”或“物理复制”，使其维度变成 [Batch, 32_heads, Seq_len, Head_dim]。
+def repeat_kv(x: torch.Tensor, rep: int):
+    if rep == 1:
+        return x
+    B, H, S, D = x.shape
+    x = x.unsqueeze(2).expand(B, H, rep, S, D).reshape(B, H * rep, S, D)
+    return x
+
+class attention(nn.Module):
+    def __init__(self,args:MokioMindConfig):
+        super().__init__()
+        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        assert args.num_attention_heads % args.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+        self.n_local_heads = args.num_attention_heads 
+        self.num_key_value_heads = args.num_key_value_heads
+        self.num_key_value_groups = self.n_local_heads // self.num_key_value_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        
+        self.q_proj = nn.Linear(in_features = args.hidden_size , out_features = self.n_local_heads * self.head_dim,bias = False)
+        self.k_proj = nn.Linear(in_features = args.hidden_size , out_features = self.num_key_value_heads * self.head_dim,bias = False)
+        self.v_proj = nn.Linear(in_features = args.hidden_size , out_features = self.num_key_value_heads * self.head_dim,bias = False)
+        self.o_proj = nn.Linear(in_features = self.n_local_heads * self.head_dim , out_features = args.hidden_size,bias = False)
+        
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        self.flash_attention = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
+
+
+        #forward之前梳理一下逻辑
+        #我们先对输入的tensor（形状是[B,S,D])，进行投影能，得到B H S D
+        #然后我们需要对Q K V进行RoPE位置编码，得到新的Q K V
+        # 然后KV记得先repat(对了注意kvcache)
+        #最后我们进行注意力计算，得到输出，最后经过线性层投影回[B,S,D]的形状，算出对应的加权value输出
+    def forward( self,x:torch.Tensor,position_embeding:Tuple[torch.Tensor,torch.Tensor],
+                    past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,use_cache: bool = False,
+                    attention_mask: Optional[torch.Tensor] = None,):
+        B,S,D = x.shape
+        xq = self.q_proj(x).view(B, S, self.n_local_heads, self.head_dim).transpose(1, 2)
+        xk = self.k_proj(x).view(B, S, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        xv = self.v_proj(x).view(B, S, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos,sin = position_embeding
+        position_ids = torch.arange(0, S, dtype=torch.long, device=x.device).unsqueeze(0)
+        xq,xk = apply_rope(cos,sin,xq,xk,position_ids = position_ids,unsqueeze_dim = 1)
+
+        if past_kv is not None:
+            xk = torch.cat([past_kv[0],xk],dim = 2)
+            xv = torch.cat([past_kv[1],xv],dim = 2)
+        past_kv = (xk,xv) if use_cache else None
+
+        kv_seq_len = xk.shape[-2]
+        xk = repeat_kv(xk,self.num_key_value_groups)
+        xv = repeat_kv(xv,self.num_key_value_groups)
+
+        if attention_mask is not None:
+            if attention_mask.shape[-1] < kv_seq_len:
+                pad_len = kv_seq_len - attention_mask.shape[-1]
+                attention_mask = F.pad(attention_mask, (pad_len, 0), value=1)
+            elif attention_mask.shape[-1] > kv_seq_len:
+                attention_mask = attention_mask[:, -kv_seq_len:]
+
+        if self.flash_attention and S > 1:
+            attn_mask = None
+            if attention_mask is not None and not torch.all(attention_mask == 1):
+                attn_mask = attention_mask[:, None, None, :].expand(B, self.n_local_heads, S, kv_seq_len).bool()
+            out_put = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
+            past_len = kv_seq_len - S
+            causal_mask = torch.triu(
+                torch.full((S, kv_seq_len), torch.finfo(scores.dtype).min, device=scores.device, dtype=scores.dtype),
+                diagonal=1 + past_len,
+            )
+            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
+
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask[:, None, None, :].to(dtype=scores.dtype)
+                extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(scores.dtype).min
+                scores = scores + extended_attention_mask
+
+            attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
+            attn_weights = self.attn_dropout(attn_weights)
+            out_put = attn_weights @ xv
+
+        out_put = out_put.transpose(1, 2).contiguous().view(B, S, self.n_local_heads * self.head_dim)
+        out_put = self.o_proj(out_put)
+        out_put = self.resid_dropout(out_put)
+        return out_put, past_kv
+    
