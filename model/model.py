@@ -2,8 +2,8 @@ from transformers import PretrainedConfig
 from typing import Optional,Tuple
 
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class HollowStoneMindConfig(PretrainedConfig):
+    model_type = "hollowstonemind"
 
     def __init__(
         self,
@@ -71,6 +71,8 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+MokioMindConfig = HollowStoneMindConfig
 
 import torch
 import math
@@ -180,12 +182,11 @@ def repeat_kv(x: torch.Tensor, rep: int):
     return x
 
 class attention(nn.Module):
-    def __init__(self,args:MokioMindConfig):
+    def __init__(self,args:HollowStoneMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
-        assert args.num_attention_heads % args.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+        assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
         self.n_local_heads = args.num_attention_heads 
-        self.num_key_value_heads = args.num_key_value_heads
         self.num_key_value_groups = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
         
@@ -210,12 +211,13 @@ class attention(nn.Module):
                     past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,use_cache: bool = False,
                     attention_mask: Optional[torch.Tensor] = None,):
         B,S,D = x.shape
+        past_len = 0 if past_kv is None else past_kv[0].shape[2]
         xq = self.q_proj(x).view(B, S, self.n_local_heads, self.head_dim).transpose(1, 2)
         xk = self.k_proj(x).view(B, S, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         xv = self.v_proj(x).view(B, S, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         cos,sin = position_embeding
-        position_ids = torch.arange(0, S, dtype=torch.long, device=x.device).unsqueeze(0)
+        position_ids = torch.arange(past_len, past_len + S, dtype=torch.long, device=x.device).unsqueeze(0)
         xq,xk = apply_rope(cos,sin,xq,xk,position_ids = position_ids,unsqueeze_dim = 1)
 
         if past_kv is not None:
@@ -269,3 +271,51 @@ class attention(nn.Module):
         out_put = self.resid_dropout(out_put)
         return out_put, past_kv
     
+class FeedForward(nn.Module):
+    #这里主要有什么呢？
+    #init
+    #MLP，门控，dropout
+    def __init__(self,args:HollowStoneMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size =  int(args.hidden_size * 8  / 3)
+            args.intermediate_size = 64* ((intermediate_size + 63) // 64)
+
+        self.up_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias = False)
+        self.down_proj = nn.Linear(args.intermediate_size,args.hidden_size,bias = False)
+        self.gate_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias = False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act] 
+
+    def forward(self,x:torch.Tensor):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+    
+class MindBlock(nn.Module):
+    def __init__(self,config:HollowStoneMindConfig,layer_id:int):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.attention = attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.mlp =FeedForward(config)
+
+    def forward(self,hidden_states,position_embeding,past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,use_cache: bool = False,attention_mask: Optional[torch.Tensor] = None):
+        residual = hidden_states
+        hidden_states,present_kv = self.attention(
+            self.input_layernorm(hidden_states),
+            position_embeding,
+            past_kv = past_kv,
+            use_cache = use_cache,
+            attention_mask = attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states,present_kv
+    
+
+       
+
