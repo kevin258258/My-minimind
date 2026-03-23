@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+out/
+checkpoints/
+
+dataset/*
+dataset/.*
+!dataset/Im_dataset.py
+!dataset/README.md
+
+model/__pycache__/
+trainer/__pycache__/
