@@ -1,0 +1,77 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            pszrx0pvcitoznd2i86rwcplup83dkep:
+                args:
+                    - --from_resume
+                    - "1"
+                    - --save_weight
+                    - pretrain
+                    - --hidden_size
+                    - "512"
+                    - --num_hidden_layers
+                    - "8"
+                    - --tokenizer_path
+                    - model
+                    - --data_path
+                    - dataset/pretrain_hq.jsonl
+                    - --save_dir
+                    - out
+                    - --checkpoint_dir
+                    - checkpoints
+                    - --use_wandb
+                codePath: trainer/pretrain.py
+                codePathLocal: trainer/pretrain.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "13.2"
+                disk:
+                    /:
+                        total: "1005646217216"
+                        used: "303716478976"
+                email: abc2014027271@gmail.com
+                executable: /home/tfx/rust_projects/My-minimind/.venv/bin/python3
+                git:
+                    commit: fee7d0b191f9d2835e8b07f184166ead2a8e21f9
+                    remote: https://github.com/kevin258258/My-minimind.git
+                gpu: NVIDIA GeForce RTX 5060 Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      cudaCores: 3328
+                      memoryTotal: "8546942976"
+                      name: NVIDIA GeForce RTX 5060 Laptop GPU
+                      uuid: GPU-14d0534e-ceb8-7e5f-9ae3-90c12f445697
+                host: cachyos-x8664
+                memory:
+                    total: "15888838656"
+                os: Linux-6.19.9-1-cachyos-x86_64-with-glibc2.43
+                program: /home/tfx/rust_projects/My-minimind/trainer/pretrain.py
+                python: CPython 3.13.12
+                root: /home/tfx/rust_projects/My-minimind
+                startedAt: "2026-03-23T13:39:27.975307Z"
+                writerId: pszrx0pvcitoznd2i86rwcplup83dkep
+        m: []
+        python_version: 3.13.12
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 51
+            "2":
+                - 1
+                - 11
+                - 49
+                - 51
+            "3":
+                - 5
+                - 13
+                - 14
+                - 62
+            "4": 3.13.12
+            "5": 0.25.1
+            "6": 5.3.0
+            "12": 0.25.1
+            "13": linux-x86_64

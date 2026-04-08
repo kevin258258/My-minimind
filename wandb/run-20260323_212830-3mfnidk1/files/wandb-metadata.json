@@ -1,0 +1,43 @@
+{
+  "os": "Linux-6.19.9-1-cachyos-x86_64-with-glibc2.43",
+  "python": "CPython 3.13.12",
+  "startedAt": "2026-03-23T13:28:30.650916Z",
+  "args": [
+    "--use_wandb"
+  ],
+  "program": "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py",
+  "codePath": "trainer/pretrain.py",
+  "codePathLocal": "trainer/pretrain.py",
+  "git": {
+    "remote": "https://github.com/kevin258258/My-minimind.git",
+    "commit": "fee7d0b191f9d2835e8b07f184166ead2a8e21f9"
+  },
+  "email": "abc2014027271@gmail.com",
+  "root": "/home/tfx/rust_projects/My-minimind",
+  "host": "cachyos-x8664",
+  "executable": "/home/tfx/rust_projects/My-minimind/.venv/bin/python3",
+  "cpu_count": 16,
+  "cpu_count_logical": 32,
+  "gpu": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "1005646217216",
+      "used": "303725367296"
+    }
+  },
+  "memory": {
+    "total": "15888838656"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 5060 Laptop GPU",
+      "memoryTotal": "8546942976",
+      "cudaCores": 3328,
+      "architecture": "Blackwell",
+      "uuid": "GPU-14d0534e-ceb8-7e5f-9ae3-90c12f445697"
+    }
+  ],
+  "cudaVersion": "13.2",
+  "writerId": "ioquams5xdqajlipjsa7mnydnvkvuknq"
+}

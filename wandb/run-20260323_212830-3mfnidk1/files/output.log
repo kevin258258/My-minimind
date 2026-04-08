@@ -1,0 +1,64 @@
+所加载Model可训练参数：29.107 百万
+Epoch:[1/1](100/44160) loss:7.101014 lr:0.000499994306 epoch_Time:231.0min:
+Traceback (most recent call last):
+  File "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py", line 381, in <module>
+    train_epoch(epoch, loader, len(loader), 0, wandb)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py", line 54, in train_epoch
+    res = model(
+        input_ids=input_ids, labels=labels, attention_mask=attention_mask
+    )  # ！修正：直接传入labels和attention_mask，由模型内部计算loss
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tfx/rust_projects/My-minimind/model/model.py", line 541, in forward
+    hidden_states, presents_kv = self.model(
+                                 ~~~~~~~~~~^
+        input_ids=input_ids,
+        ^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        **kwargs,
+        ^^^^^^^^^
+    )
+    ^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tfx/rust_projects/My-minimind/model/model.py", line 461, in forward
+    hidden_states, present_kv = layer(
+                                ~~~~~^
+        hidden_states,
+        ^^^^^^^^^^^^^^
+    ...<3 lines>...
+        attention_mask=attention_mask,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tfx/rust_projects/My-minimind/model/model.py", line 397, in forward
+    hidden_states, present_kv = self.attention(
+                                ~~~~~~~~~~~~~~^
+        self.input_layernorm(hidden_states),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        attention_mask=attention_mask,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/tfx/rust_projects/My-minimind/model/model.py", line 303, in forward
+    .expand(B, self.n_local_heads, S, kv_seq_len)
+     ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

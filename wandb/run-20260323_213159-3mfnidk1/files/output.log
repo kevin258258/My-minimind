@@ -1,0 +1,10 @@
+所加载Model可训练参数：29.107 百万
+Epoch [1/1]: 跳过前100个step，从step 101开始
+Epoch:[1/1](200/44160) loss:6.386062 lr:0.000499977226 epoch_Time:120.0min:
+Traceback (most recent call last):
+  File "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py", line 371, in <module>
+    train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py", line 41, in train_epoch
+    input_ids = batch["input_ids"].to(args.device)
+KeyboardInterrupt

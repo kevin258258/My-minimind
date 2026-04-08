@@ -348,6 +348,86 @@ class attention(nn.Module):
         return out_put, past_kv
 
 
+class MoEExpert(nn.Module):
+    def __init__(self, args: HollowStoneMindConfig):
+        super().__init__()
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoE(nn.Module):
+    def __init__(self, args: HollowStoneMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64 * ((intermediate_size + 63) // 64)
+
+        self.n_routed_experts = args.n_routed_experts
+        self.n_shared_experts = args.n_shared_experts
+        self.num_experts_per_tok = min(args.num_experts_per_tok, args.n_routed_experts)
+        self.scoring_func = args.scoring_func
+        self.aux_loss_alpha = args.aux_loss_alpha
+        self.norm_topk_prob = args.norm_topk_prob
+        self.dropout = nn.Dropout(args.dropout)
+
+        self.gate = nn.Linear(args.hidden_size, self.n_routed_experts, bias=False)
+        self.routed_experts = nn.ModuleList(
+            [MoEExpert(args) for _ in range(self.n_routed_experts)]
+        )
+        self.shared_experts = nn.ModuleList(
+            [MoEExpert(args) for _ in range(self.n_shared_experts)]
+        )
+
+    def forward(self, x: torch.Tensor):
+        bsz, seq_len, hidden_size = x.shape
+        x_flat = x.reshape(-1, hidden_size)
+
+        logits = self.gate(x_flat)
+        if self.scoring_func == "sigmoid":
+            scores = torch.sigmoid(logits)
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-9)
+        else:
+            scores = F.softmax(logits, dim=-1)
+
+        topk_weight, topk_idx = torch.topk(
+            scores, k=self.num_experts_per_tok, dim=-1, largest=True, sorted=False
+        )
+        if self.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-9)
+
+        out_flat = x_flat.new_zeros(x_flat.shape)
+        for expert_id, expert in enumerate(self.routed_experts):
+            token_idx, slot_idx = torch.where(topk_idx == expert_id)
+            if token_idx.numel() == 0:
+                continue
+            expert_out = expert(x_flat[token_idx])
+            weight = topk_weight[token_idx, slot_idx].unsqueeze(-1).to(expert_out.dtype)
+            out_flat[token_idx] += expert_out * weight
+
+        if self.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                out_flat += expert(x_flat)
+
+        out = self.dropout(out_flat.view(bsz, seq_len, hidden_size))
+
+        aux_loss = None
+        if self.training and self.aux_loss_alpha > 0:
+            topk_one_hot = F.one_hot(
+                topk_idx, num_classes=self.n_routed_experts
+            ).to(scores.dtype)
+            topk_one_hot = topk_one_hot.sum(dim=1) / float(self.num_experts_per_tok)
+            fi = topk_one_hot.mean(dim=0)
+            pi = scores.mean(dim=0)
+            aux_loss = (
+                (fi * pi).sum() * float(self.n_routed_experts) * self.aux_loss_alpha
+            )
+
+        return out, aux_loss
 class FeedForward(nn.Module):
     # 这里主要有什么呢？
     # init
@@ -383,7 +463,8 @@ class MindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = FeedForward(config)
+        self.mlp = MoE(config) if config.use_moe else FeedForward(config)
+
 
     def forward(
         self,
@@ -402,10 +483,12 @@ class MindBlock(nn.Module):
             attention_mask=attention_mask,
         )
         hidden_states = residual + hidden_states
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
-        )
-        return hidden_states, present_kv
+        mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
+        aux_loss = None
+        if isinstance(mlp_out, tuple):
+            mlp_out, aux_loss = mlp_out
+        hidden_states = hidden_states + mlp_out
+        return hidden_states, present_kv, aux_loss
 
 
 class HollowStoneMindModel(nn.Module):
@@ -457,8 +540,9 @@ class HollowStoneMindModel(nn.Module):
         position_embeding = (self.freqs_cos, self.freqs_sin)
 
         presents_kv = []
+        aux_loss = None
         for layer, layer_past_kv in zip(self.layers, past_kv):
-            hidden_states, present_kv = layer(
+            hidden_states, present_kv, layer_aux_loss = layer(
                 hidden_states,
                 position_embeding,
                 past_kv=layer_past_kv,
@@ -466,10 +550,12 @@ class HollowStoneMindModel(nn.Module):
                 attention_mask=attention_mask,
             )
             presents_kv.append(present_kv)
+            if layer_aux_loss is not None:
+                aux_loss = layer_aux_loss if aux_loss is None else (aux_loss + layer_aux_loss)
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents_kv
+        return hidden_states, presents_kv, aux_loss
 
 
 class HollowStoneMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -538,7 +624,7 @@ class HollowStoneMindForCausalLM(PreTrainedModel, GenerationMixin):
             else getattr(self.config, "use_cache", True)
         )
 
-        hidden_states, presents_kv = self.model(
+        hidden_states, presents_kv, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_kv=past_key_values,
@@ -558,11 +644,13 @@ class HollowStoneMindForCausalLM(PreTrainedModel, GenerationMixin):
             )
 
         if not return_dict:
-            output = (logits, presents_kv)
+            output = (logits, presents_kv, aux_loss)
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=presents_kv,
         )
+        output.aux_loss = aux_loss
+        return output

@@ -1,0 +1,34 @@
+所加载Model可训练参数：29.107 百万
+Epoch [1/1]: 跳过前200个step，从step 201开始
+Traceback (most recent call last):
+  File "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py", line 371, in <module>
+    train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/tfx/rust_projects/My-minimind/trainer/pretrain.py", line 63, in train_epoch
+    scaler.scale(loss).backward()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/_tensor.py", line 630, in backward
+    torch.autograd.backward(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        self, gradient, retain_graph, create_graph, inputs=inputs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/autograd/__init__.py", line 364, in backward
+    _engine_run_backward(
+    ~~~~~~~~~~~~~~~~~~~~^
+        tensors,
+        ^^^^^^^^
+    ...<5 lines>...
+        accumulate_grad=True,
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/tfx/rust_projects/My-minimind/.venv/lib/python3.13/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        t_outputs, *args, **kwargs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )  # Calls into the C++ engine to run the backward pass
+    ^
+KeyboardInterrupt
