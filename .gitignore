@@ -11,3 +11,4 @@ dataset/.*
 
 model/__pycache__/
 trainer/__pycache__/
+notes/
