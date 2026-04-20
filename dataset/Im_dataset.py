@@ -105,14 +105,6 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         self.samples = load_json_dataset(data_path)
         self.pad_token_id = self._get_pad_token_id()
-        self.assistant_prefix_ids = self.tokenizer(
-            f"{self.tokenizer.bos_token}assistant\n",
-            add_special_tokens=False,
-        ).input_ids
-        self.turn_suffix_ids = self.tokenizer(
-            f"{self.tokenizer.eos_token}\n",
-            add_special_tokens=False,
-        ).input_ids
 
     def _get_pad_token_id(self):
         if self.tokenizer.pad_token_id is not None:
@@ -129,7 +121,6 @@ class SFTDataset(Dataset):
         tools = None
         if messages:
             tools = messages[0].get("tools") or messages[0].get("function")
-
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -137,46 +128,41 @@ class SFTDataset(Dataset):
             tools=tools,
         )
 
-    def generate_labels(self, input_ids):
+    def _tokenize_chat(self, conversations):
+        if not conversations:
+            return []
+        prompt = self.create_chat_prompt(conversations)
+        prompt = post_processing_chat(prompt)
+        return self.tokenizer(prompt, add_special_tokens=False).input_ids
+
+    def generate_labels(self, conversations, input_ids):
         labels = [-100] * len(input_ids)
-        prefix_len = len(self.assistant_prefix_ids)
-        suffix_len = len(self.turn_suffix_ids)
 
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i : i + prefix_len] == self.assistant_prefix_ids:
-                start = i + prefix_len
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end : end + suffix_len] == self.turn_suffix_ids:
-                        end += suffix_len
-                        break
-                    end += 1
-
-                if end > len(input_ids):
-                    end = len(input_ids)
-
-                for j in range(start, min(end, len(input_ids))):
-                    labels[j] = input_ids[j]
-                i = end
+        # 对每个 assistant 消息，比较“拼接前后”token边界来定位可学习区间，
+        # 避免和具体 chat_template 的特殊token格式硬编码耦合。
+        for i, msg in enumerate(conversations):
+            if msg.get("role") != "assistant":
                 continue
-            i += 1
+
+            prev_ids = self._tokenize_chat(conversations[:i])
+            curr_ids = self._tokenize_chat(conversations[: i + 1])
+
+            start = min(len(prev_ids), len(input_ids))
+            end = min(len(curr_ids), len(input_ids))
+            for j in range(start, end):
+                labels[j] = input_ids[j]
 
         return labels
 
     def __getitem__(self, index):
         sample = self.samples[index]
         conversations = pre_processing_chat(sample["conversations"])
-        prompt = self.create_chat_prompt(conversations)
-        prompt = post_processing_chat(prompt)
+        input_ids = self._tokenize_chat(conversations)
+        labels = self.generate_labels(conversations, input_ids)
 
-        input_ids = self.tokenizer(
-            prompt,
-            add_special_tokens=False,
-            max_length=self.max_length,
-            truncation=True,
-        ).input_ids
-        labels = self.generate_labels(input_ids)
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[: self.max_length]
+            labels = labels[: self.max_length]
 
         attention_mask = [1] * len(input_ids)
         pad_len = self.max_length - len(input_ids)
@@ -189,4 +175,95 @@ class SFTDataset(Dataset):
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
+
+
+class DPODataset(Dataset):
+    def __init__(self, data_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = load_json_dataset(data_path)
+        self.pad_token_id = self._get_pad_token_id()
+
+    def _get_pad_token_id(self):
+        if self.tokenizer.pad_token_id is not None:
+            return self.tokenizer.pad_token_id
+        if getattr(self.tokenizer, "eos_token_id", None) is not None:
+            return self.tokenizer.eos_token_id
+        raise ValueError("Tokenizer must define pad_token_id or eos_token_id")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def create_chat_prompt(self, conversations):
+        messages = list(conversations)
+        tools = None
+        if messages:
+            tools = messages[0].get("tools") or messages[0].get("function")
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            tools=tools,
+        )
+
+    def _tokenize_chat(self, conversations):
+        if not conversations:
+            return []
+        prompt = self.create_chat_prompt(conversations)
+        prompt = post_processing_chat(prompt)
+        return self.tokenizer(prompt, add_special_tokens=False).input_ids
+
+    def generate_labels(self, conversations, input_ids):
+        labels = [-100] * len(input_ids)
+        for i, msg in enumerate(conversations):
+            if msg.get("role") != "assistant":
+                continue
+
+            prev_ids = self._tokenize_chat(conversations[:i])
+            curr_ids = self._tokenize_chat(conversations[: i + 1])
+            start = min(len(prev_ids), len(input_ids))
+            end = min(len(curr_ids), len(input_ids))
+            for j in range(start, end):
+                labels[j] = input_ids[j]
+        return labels
+
+    def _build_features(self, conversations):
+        # DPO中不做随机system增强，避免chosen/rejected对的噪声不一致
+        input_ids = self._tokenize_chat(conversations)
+        labels = self.generate_labels(conversations, input_ids)
+
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[: self.max_length]
+            labels = labels[: self.max_length]
+
+        attention_mask = [1] * len(input_ids)
+        pad_len = self.max_length - len(input_ids)
+        if pad_len > 0:
+            input_ids = input_ids + [self.pad_token_id] * pad_len
+            labels = labels + [-100] * pad_len
+            attention_mask = attention_mask + [0] * pad_len
+
+        return (
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(labels, dtype=torch.long),
+            torch.tensor(attention_mask, dtype=torch.long),
+        )
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        chosen = sample["chosen"]
+        rejected = sample["rejected"]
+
+        c_input_ids, c_labels, c_attention_mask = self._build_features(chosen)
+        r_input_ids, r_labels, r_attention_mask = self._build_features(rejected)
+
+        return {
+            "chosen_input_ids": c_input_ids,
+            "chosen_labels": c_labels,
+            "chosen_attention_mask": c_attention_mask,
+            "rejected_input_ids": r_input_ids,
+            "rejected_labels": r_labels,
+            "rejected_attention_mask": r_attention_mask,
         }

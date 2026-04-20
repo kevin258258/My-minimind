@@ -7,6 +7,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
@@ -15,14 +16,8 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-from dataset.Im_dataset import SFTDataset
-from model.model import HollowStoneMindConfig
-from model.model_lora import (
-    apply_lora,
-    lora_state_dict,
-    mark_only_lora_trainable,
-    save_lora,
-)
+from dataset.Im_dataset import DPODataset
+from model.model import HollowStoneMindConfig, HollowStoneMindForCausalLM
 from trainer.trainer_utils import (
     Logger,
     SkipBatchSampler,
@@ -31,6 +26,7 @@ from trainer.trainer_utils import (
     init_model,
     is_main_process,
     lm_checkpoint,
+    safe_torch_load,
     setup_seed,
 )
 
@@ -38,7 +34,7 @@ warnings.filterwarnings("ignore")
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="HollowStoneMind LoRA Fine-tuning")
+    parser = argparse.ArgumentParser(description="HollowStoneMind DPO")
 
     parser.add_argument(
         "--save_dir",
@@ -52,15 +48,11 @@ def build_parser():
         default=os.path.join(PROJECT_ROOT, "checkpoints"),
         help="训练断点和完整checkpoint保存目录",
     )
-    parser.add_argument(
-        "--lora_name",
-        type=str,
-        default="lora_medical",
-        help="LoRA权重名称",
-    )
-    parser.add_argument("--epochs", type=int, default=5, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
+    parser.add_argument("--save_weight", default="dpo", type=str, help="保存权重前缀")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="初始学习率")
+    parser.add_argument("--beta", type=float, default=0.1, help="DPO温度系数beta")
 
     parser.add_argument(
         "--device",
@@ -89,21 +81,11 @@ def build_parser():
         help="是否使用MoE架构（0=否，1=是）",
     )
 
-    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
-    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout")
-    parser.add_argument(
-        "--target_modules",
-        type=str,
-        default="q_proj,k_proj,v_proj,o_proj",
-        help="需要注入LoRA的线性层名，逗号分隔",
-    )
-
     parser.add_argument(
         "--data_path",
         type=str,
-        default=os.path.join(PROJECT_ROOT, "dataset", "lora_medical.jsonl"),
-        help="LoRA训练数据路径",
+        default=os.path.join(PROJECT_ROOT, "dataset", "dpo.jsonl"),
+        help="DPO数据路径",
     )
     parser.add_argument(
         "--tokenizer_path",
@@ -115,7 +97,13 @@ def build_parser():
         "--from_weight",
         default="sft",
         type=str,
-        help="基于哪个权重继续训练",
+        help="policy初始化权重",
+    )
+    parser.add_argument(
+        "--reference_weight",
+        default="sft",
+        type=str,
+        help="reference模型权重（默认和from_weight一致）",
     )
     parser.add_argument(
         "--from_resume",
@@ -127,18 +115,50 @@ def build_parser():
 
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument(
-        "--wandb_project", type=str, default="HollowStoneMind-LoRA", help="wandb项目名"
+        "--wandb_project", type=str, default="HollowStoneMind-DPO", help="wandb项目名"
     )
     return parser
 
 
-def train_epoch(epoch, loader, steps_per_epoch, lora_params, start_step=0, wandb=None):
+def sequence_log_probs(logits, labels):
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    valid_mask = shift_labels.ne(-100)
+    safe_labels = shift_labels.masked_fill(~valid_mask, 0)
+
+    token_log_probs = torch.gather(
+        F.log_softmax(shift_logits.float(), dim=-1), dim=-1, index=safe_labels.unsqueeze(-1)
+    ).squeeze(-1)
+    return (token_log_probs * valid_mask).sum(dim=-1)
+
+
+def dpo_loss(
+    policy_chosen_logps,
+    policy_rejected_logps,
+    ref_chosen_logps,
+    ref_rejected_logps,
+    beta,
+):
+    pi_logratios = policy_chosen_logps - policy_rejected_logps
+    ref_logratios = ref_chosen_logps - ref_rejected_logps
+    logits = beta * (pi_logratios - ref_logratios)
+    losses = -F.logsigmoid(logits)
+    chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
+    rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
+    reward_acc = (chosen_rewards > rejected_rewards).float().mean()
+    return losses.mean(), chosen_rewards.mean(), rejected_rewards.mean(), reward_acc
+
+
+def train_epoch(epoch, loader, steps_per_epoch, start_step=0, wandb=None):
     start_time = time.time()
 
     for step, batch in enumerate(loader, start=start_step + 1):
-        input_ids = batch["input_ids"].to(args.device)
-        labels = batch["labels"].to(args.device)
-        attention_mask = batch["attention_mask"].to(args.device)
+        chosen_input_ids = batch["chosen_input_ids"].to(args.device)
+        chosen_labels = batch["chosen_labels"].to(args.device)
+        chosen_attention_mask = batch["chosen_attention_mask"].to(args.device)
+        rejected_input_ids = batch["rejected_input_ids"].to(args.device)
+        rejected_labels = batch["rejected_labels"].to(args.device)
+        rejected_attention_mask = batch["rejected_attention_mask"].to(args.device)
 
         lr = get_lr(
             epoch * steps_per_epoch + step,
@@ -149,20 +169,64 @@ def train_epoch(epoch, loader, steps_per_epoch, lora_params, start_step=0, wandb
             param_group["lr"] = lr
 
         with autocast_ctx:
-            res = model(
-                input_ids=input_ids,
-                labels=labels,
-                attention_mask=attention_mask,
+            policy_chosen = model(
+                input_ids=chosen_input_ids,
+                attention_mask=chosen_attention_mask,
+                use_cache=False,
             )
-            aux_loss = getattr(res, "aux_loss", None)
-            loss = res.loss if aux_loss is None else res.loss + aux_loss
+            policy_rejected = model(
+                input_ids=rejected_input_ids,
+                attention_mask=rejected_attention_mask,
+                use_cache=False,
+            )
+            aux_chosen = getattr(policy_chosen, "aux_loss", None)
+            aux_rejected = getattr(policy_rejected, "aux_loss", None)
+
+            policy_chosen_logps = sequence_log_probs(policy_chosen.logits, chosen_labels)
+            policy_rejected_logps = sequence_log_probs(
+                policy_rejected.logits, rejected_labels
+            )
+
+            with torch.no_grad():
+                ref_chosen = ref_model(
+                    input_ids=chosen_input_ids,
+                    attention_mask=chosen_attention_mask,
+                    use_cache=False,
+                )
+                ref_rejected = ref_model(
+                    input_ids=rejected_input_ids,
+                    attention_mask=rejected_attention_mask,
+                    use_cache=False,
+                )
+                ref_chosen_logps = sequence_log_probs(ref_chosen.logits, chosen_labels)
+                ref_rejected_logps = sequence_log_probs(
+                    ref_rejected.logits, rejected_labels
+                )
+
+            dpo_obj, chosen_reward, rejected_reward, reward_acc = dpo_loss(
+                policy_chosen_logps=policy_chosen_logps,
+                policy_rejected_logps=policy_rejected_logps,
+                ref_chosen_logps=ref_chosen_logps,
+                ref_rejected_logps=ref_rejected_logps,
+                beta=args.beta,
+            )
+
+            aux_loss = None
+            if aux_chosen is not None and aux_rejected is not None:
+                aux_loss = 0.5 * (aux_chosen + aux_rejected)
+            elif aux_chosen is not None:
+                aux_loss = aux_chosen
+            elif aux_rejected is not None:
+                aux_loss = aux_rejected
+
+            loss = dpo_obj if aux_loss is None else (dpo_obj + aux_loss)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0 or step == steps_per_epoch:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -175,12 +239,23 @@ def train_epoch(epoch, loader, steps_per_epoch, lora_params, start_step=0, wandb
                 steps_per_epoch - step
             ) // 60
             Logger(
-                f"LoRA Epoch:[{epoch + 1}/{args.epochs}]({step}/{steps_per_epoch}) "
-                f"loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
+                f"DPO Epoch:[{epoch + 1}/{args.epochs}]({step}/{steps_per_epoch}) "
+                f"loss:{current_loss:.6f} lr:{current_lr:.12f} "
+                f"chosen_reward:{chosen_reward.item():.6f} "
+                f"rejected_reward:{rejected_reward.item():.6f} "
+                f"reward_acc:{reward_acc.item():.4f} "
+                f"epoch_Time:{eta_min}min:"
             )
             if wandb:
                 wandb.log(
-                    {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
+                    {
+                        "loss": current_loss,
+                        "lr": current_lr,
+                        "chosen_reward": chosen_reward.item(),
+                        "rejected_reward": rejected_reward.item(),
+                        "reward_acc": reward_acc.item(),
+                        "epoch_Time": eta_min,
+                    }
                 )
 
         if (step % args.save_interval == 0 or step == steps_per_epoch) and is_main_process():
@@ -188,13 +263,16 @@ def train_epoch(epoch, loader, steps_per_epoch, lora_params, start_step=0, wandb
             moe_suffix = (
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             )
-            lora_save_path = (
-                f"{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}{moe_suffix}.pth"
-            )
-            save_lora(model, lora_save_path)
+            ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
+
+            torch.save({k: v.half() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(
                 lm_config,
-                weight=args.lora_name,
+                weight=args.save_weight,
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -202,14 +280,25 @@ def train_epoch(epoch, loader, steps_per_epoch, lora_params, start_step=0, wandb
                 step=step,
                 wandb=wandb,
                 save_dir=args.checkpoint_dir,
-                save_full_model=False,
-                lora_state=lora_state_dict(model),
             )
             model.train()
 
 
+def build_reference_model(config, reference_weight, save_dir, device):
+    ref = HollowStoneMindForCausalLM(config).to(device)
+    if reference_weight != "none":
+        moe_suffix = "_moe" if getattr(config, "use_moe", False) else ""
+        weight_path = f"{save_dir}/{reference_weight}_{config.hidden_size}{moe_suffix}.pth"
+        weights = safe_torch_load(weight_path, map_location=device, weights_only=True)
+        ref.load_state_dict(weights, strict=False)
+    ref.eval()
+    for p in ref.parameters():
+        p.requires_grad = False
+    return ref
+
+
 def main():
-    global args, lm_config, model, optimizer, scaler, autocast_ctx
+    global args, lm_config, model, ref_model, optimizer, scaler, autocast_ctx
 
     parser = build_parser()
     args = parser.parse_args()
@@ -230,7 +319,7 @@ def main():
     ckp_data = (
         lm_checkpoint(
             lm_config,
-            weight=args.lora_name,
+            weight=args.save_weight,
             save_dir=args.checkpoint_dir,
         )
         if args.from_resume == 1
@@ -250,7 +339,7 @@ def main():
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
         resume = "must" if wandb_id else None
         wandb_run_name = (
-            f"HollowStoneMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-"
+            f"HollowStoneMind-DPO-Epoch-{args.epochs}-"
             f"BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         )
         wandb.init(
@@ -267,41 +356,24 @@ def main():
         save_dir=args.save_dir,
         device=args.device,
     )
-    adapted_modules = apply_lora(
-        model,
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-        target_modules=args.target_modules,
+    ref_model = build_reference_model(
+        lm_config,
+        args.reference_weight,
+        args.save_dir,
+        args.device,
     )
-    if not adapted_modules:
-        raise ValueError(
-            f"No modules matched target_modules={args.target_modules!r} for LoRA injection"
-        )
-    Logger(f"LoRA injected modules: {', '.join(adapted_modules)}")
 
-    lora_params = mark_only_lora_trainable(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    lora_params_count = sum(p.numel() for p in lora_params)
-    Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
-    Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
-    Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
-
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     local_samples = len(train_sampler) if train_sampler is not None else len(train_ds)
     steps_per_epoch = (local_samples + args.batch_size - 1) // args.batch_size
+
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
-    optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     start_epoch, start_step = 0, 0
     if ckp_data:
-        lora_state = ckp_data.get("lora_state")
-        if lora_state is not None:
-            model.load_state_dict(lora_state, strict=False)
-        elif ckp_data.get("model") is not None:
-            # 兼容历史checkpoint格式（包含完整模型）
-            model.load_state_dict(ckp_data["model"], strict=False)
+        model.load_state_dict(ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])
         scaler.load_state_dict(ckp_data["scaler"])
         start_epoch = ckp_data["epoch"]
@@ -326,16 +398,9 @@ def main():
                 pin_memory=True,
             )
             Logger(
-                f"LoRA Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
+                f"DPO Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
-            train_epoch(
-                epoch,
-                loader,
-                steps_per_epoch,
-                lora_params,
-                start_step,
-                wandb,
-            )
+            train_epoch(epoch, loader, steps_per_epoch, start_step, wandb)
         else:
             loader = DataLoader(
                 train_ds,
@@ -345,7 +410,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True,
             )
-            train_epoch(epoch, loader, steps_per_epoch, lora_params, 0, wandb)
+            train_epoch(epoch, loader, steps_per_epoch, 0, wandb)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,14 @@ import torch.distributed as dist
 from torch.utils.data import Sampler
 
 
+def safe_torch_load(path, map_location="cpu", weights_only=True):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        # 兼容较老版本PyTorch（不支持weights_only参数）
+        return torch.load(path, map_location=map_location)
+
+
 # 检查是否是主进程
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -57,6 +65,7 @@ def lm_checkpoint(
     step=0,
     wandb=None,
     save_dir="checkpoints",
+    save_full_model=True,
     **kwargs,
 ):
     os.makedirs(save_dir, exist_ok=True)
@@ -68,14 +77,17 @@ def lm_checkpoint(
     if model is not None:
         from torch.nn.parallel import DistributedDataParallel
 
-        if isinstance(model, DistributedDataParallel):
-            state_dict = model.module.state_dict()
-        else:
-            state_dict = model.state_dict()
+        state_dict = kwargs.pop("model_state_dict", None)
+        if state_dict is None:
+            if isinstance(model, DistributedDataParallel):
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
 
-        ckp_tmp = ckp_path + ".tmp"
-        torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)
-        os.replace(ckp_tmp, ckp_path)
+        if save_full_model:
+            ckp_tmp = ckp_path + ".tmp"
+            torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)
+            os.replace(ckp_tmp, ckp_path)
 
         wandb_id = None
         if wandb:
@@ -83,7 +95,7 @@ def lm_checkpoint(
             wandb_id = getattr(run, "id", None) if run is not None else None
 
         resume_data = {
-            "model": state_dict,
+            "model": state_dict if save_full_model else None,
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "step": step,
@@ -107,7 +119,9 @@ def lm_checkpoint(
 
     else:  # 加载模式
         if os.path.exists(resume_path):
-            ckp_data = torch.load(resume_path, map_location="cpu")
+            ckp_data = safe_torch_load(
+                resume_path, map_location="cpu", weights_only=False
+            )
             saved_ws = ckp_data.get("world_size", 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -149,7 +163,7 @@ def init_model(
             f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
         )
 
-        weights = torch.load(weight_path, map_location=device)
+        weights = safe_torch_load(weight_path, map_location=device, weights_only=True)
 
         model.load_state_dict(weights, strict=False)
 

@@ -5,6 +5,13 @@ import torch
 from torch import nn
 
 
+def safe_torch_load(path, map_location="cpu", weights_only=True):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=weights_only)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class LoRALinear(nn.Module):
     def __init__(self, base_layer, rank=8, alpha=None, dropout=0.0):
         super().__init__()
@@ -129,7 +136,7 @@ def save_lora(model, path):
 
 def load_lora(model, path, map_location="cpu"):
     raw_model = _unwrap_model(model)
-    state_dict = torch.load(path, map_location=map_location)
+    state_dict = safe_torch_load(path, map_location=map_location, weights_only=True)
     cleaned_state = {}
     for key, value in state_dict.items():
         if key.startswith("module."):
