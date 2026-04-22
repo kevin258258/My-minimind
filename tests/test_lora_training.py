@@ -60,6 +60,19 @@ class LoRATests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(expected, actual))
 
+    def test_mark_only_lora_trainable_freezes_base_weights(self):
+        from model.model_lora import apply_lora, mark_only_lora_trainable
+
+        model = ToyModel()
+        apply_lora(model, rank=2, target_modules=("q_proj",))
+        lora_params = mark_only_lora_trainable(model)
+
+        self.assertTrue(lora_params)
+        self.assertTrue(all(param.requires_grad for param in lora_params))
+        self.assertFalse(model.q_proj.base_layer.weight.requires_grad)
+        self.assertFalse(model.k_proj.weight.requires_grad)
+        self.assertFalse(model.ffn.weight.requires_grad)
+
 
 class TrainLoRAScriptTests(unittest.TestCase):
     def test_build_parser_uses_repo_defaults(self):

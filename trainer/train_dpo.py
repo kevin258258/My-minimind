@@ -26,6 +26,7 @@ from trainer.trainer_utils import (
     init_model,
     is_main_process,
     lm_checkpoint,
+    normalize_state_dict_keys,
     safe_torch_load,
     setup_seed,
 )
@@ -290,6 +291,7 @@ def build_reference_model(config, reference_weight, save_dir, device):
         moe_suffix = "_moe" if getattr(config, "use_moe", False) else ""
         weight_path = f"{save_dir}/{reference_weight}_{config.hidden_size}{moe_suffix}.pth"
         weights = safe_torch_load(weight_path, map_location=device, weights_only=True)
+        weights = normalize_state_dict_keys(weights)
         ref.load_state_dict(weights, strict=False)
     ref.eval()
     for p in ref.parameters():

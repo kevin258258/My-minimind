@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+
 
 class TokenResult:
     def __init__(self, input_ids):
@@ -74,7 +76,7 @@ class SFTDatasetTests(unittest.TestCase):
 
         labels = item["labels"].tolist()
         visible_ids = [token for token in labels if token != -100]
-        assistant_text_ids = [ord(ch) + 10 for ch in "4</s>\n"]
+        assistant_text_ids = [ord(ch) + 10 for ch in "<s>assistant\n4</s>\n"]
 
         self.assertEqual(visible_ids, assistant_text_ids)
 
@@ -90,6 +92,37 @@ class TrainSFTScriptTests(unittest.TestCase):
         self.assertEqual(args.from_weight, "pretrain")
         self.assertTrue(args.data_path.endswith("dataset/sft_mini_512.jsonl"))
         self.assertEqual(args.max_seq_len, 512)
+
+    def test_init_model_loads_legacy_self_attn_checkpoint_keys(self):
+        from model.model import HollowStoneMindConfig, HollowStoneMindForCausalLM
+        from trainer.trainer_utils import init_model
+
+        config = HollowStoneMindConfig(hidden_size=32, num_hidden_layers=1)
+        source_model = HollowStoneMindForCausalLM(config)
+        source_state = source_model.state_dict()
+        legacy_state = {
+            key.replace(".attention.", ".self_attn."): value
+            for key, value in source_state.items()
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            weight_path = Path(tmpdir) / "legacy_32.pth"
+            torch.save(legacy_state, weight_path)
+
+            loaded_model, _ = init_model(
+                config,
+                from_weight="legacy",
+                tokenizer_path="model",
+                save_dir=tmpdir,
+                device="cpu",
+            )
+
+        self.assertTrue(
+            torch.equal(
+                loaded_model.model.layers[0].attention.q_proj.weight,
+                source_model.model.layers[0].attention.q_proj.weight,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -111,7 +111,7 @@ def build_parser():
     return parser
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(epoch, loader, steps_per_epoch, start_step=0, wandb=None):
     start_time = time.time()
 
     for step, batch in enumerate(loader, start=start_step + 1):
@@ -119,7 +119,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         labels = batch["labels"].to(args.device)
         attention_mask = batch["attention_mask"].to(args.device)
 
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(
+            epoch * steps_per_epoch + step,
+            args.epochs * steps_per_epoch,
+            args.learning_rate,
+        )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -135,20 +139,22 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         scaler.scale(loss).backward()
 
-        if step % args.accumulation_steps == 0 or step == iters:
+        if step % args.accumulation_steps == 0 or step == steps_per_epoch:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters:
+        if step % args.log_interval == 0 or step == steps_per_epoch:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]["lr"]
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = (
+                spend_time / (step + 1) * steps_per_epoch // 60 - spend_time // 60
+            )
             Logger(
-                f"SFT Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) "
+                f"SFT Epoch:[{epoch + 1}/{args.epochs}]({step}/{steps_per_epoch}) "
                 f"loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
             )
             if wandb:
@@ -156,7 +162,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if (step % args.save_interval == 0 or step == steps_per_epoch) and is_main_process():
             model.eval()
             moe_suffix = (
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
@@ -262,6 +268,9 @@ def main():
         if train_sampler:
             train_sampler.set_epoch(epoch)
 
+        local_samples = len(train_sampler) if train_sampler is not None else len(train_ds)
+        steps_per_epoch = (local_samples + args.batch_size - 1) // args.batch_size
+
         if epoch == start_epoch and start_step > 0:
             batch_sampler = SkipBatchSampler(
                 train_sampler or range(len(train_ds)), args.batch_size, start_step
@@ -275,7 +284,7 @@ def main():
             Logger(
                 f"SFT Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
-            train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
+            train_epoch(epoch, loader, steps_per_epoch, start_step, wandb)
         else:
             loader = DataLoader(
                 train_ds,
@@ -285,7 +294,7 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True,
             )
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, steps_per_epoch, 0, wandb)
 
 
 if __name__ == "__main__":

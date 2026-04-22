@@ -15,6 +15,20 @@ def safe_torch_load(path, map_location="cpu", weights_only=True):
         return torch.load(path, map_location=map_location)
 
 
+def normalize_state_dict_keys(state_dict):
+    if not isinstance(state_dict, dict):
+        return state_dict
+
+    normalized = {}
+    for key, value in state_dict.items():
+        normalized_key = (
+            key.replace(".self_attn.", ".attention.")
+            .replace(".mlp.experts.", ".mlp.routed_experts.")
+        )
+        normalized[normalized_key] = value
+    return normalized
+
+
 # 检查是否是主进程
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -164,6 +178,7 @@ def init_model(
         )
 
         weights = safe_torch_load(weight_path, map_location=device, weights_only=True)
+        weights = normalize_state_dict_keys(weights)
 
         model.load_state_dict(weights, strict=False)
 

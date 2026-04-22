@@ -53,6 +53,7 @@ class LoRALinear(nn.Module):
             self.base_layer.out_features,
             bias=self.base_layer.bias is not None,
         )
+        merged = merged.to(self.base_layer.weight.device)
         merged.weight.data.copy_(self.base_layer.weight.data)
         if self.base_layer.bias is not None:
             merged.bias.data.copy_(self.base_layer.bias.data)
@@ -95,11 +96,9 @@ def apply_lora(model, rank=8, alpha=None, dropout=0.0, target_modules=None):
             if isinstance(child, LoRALinear):
                 continue
             if isinstance(child, nn.Linear) and child_name in targets:
-                setattr(
-                    module,
-                    child_name,
-                    LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout),
-                )
+                lora_layer = LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout)
+                lora_layer = lora_layer.to(child.weight.device)
+                setattr(module, child_name, lora_layer)
                 replaced.append(full_name)
                 continue
             _replace(child, full_name)

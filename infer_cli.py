@@ -6,6 +6,23 @@ import torch
 from transformers import AutoTokenizer
 
 from model.model import HollowStoneMindConfig, HollowStoneMindForCausalLM
+from model.model_lora import apply_lora, load_lora, merge_lora
+
+
+def resolve_default_model_path():
+    """自动探测可用的模型权重，优先顺序：sft > dpo > pretrain"""
+    candidates = [
+        os.path.join("out", "sft_512.pth"),
+        os.path.join("out", "sft_512_moe.pth"),
+        os.path.join("out", "dpo_512.pth"),
+        os.path.join("out", "dpo_512_moe.pth"),
+        os.path.join("out", "pretrain_512.pth"),
+        os.path.join("out", "pretrain_512_moe.pth"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
 
 
 def parse_args():
@@ -15,7 +32,7 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.path.join("out", "pretrain_512.pth"),
+        default=resolve_default_model_path(),
         help="Path to the exported model weight file",
     )
     parser.add_argument(
@@ -113,9 +130,33 @@ def parse_args():
     parser.add_argument(
         "--prompt_format",
         type=str,
-        default="qa",
-        choices=["raw", "qa", "chat_template"],
+        default="auto",
+        choices=["auto", "raw", "qa", "chat_template"],
         help="Prompt formatting strategy for generation",
+    )
+    parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="Path to LoRA weights (optional). If provided, LoRA will be merged for inference.",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=8,
+        help="LoRA rank (must match training config)",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="LoRA alpha (must match training config)",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj",
+        help="LoRA target modules, comma separated",
     )
     return parser.parse_args()
 
@@ -179,7 +220,7 @@ def build_model(args):
     elif inferred_shared > 0:
         n_shared = inferred_shared
     else:
-        n_shared = 0 if use_moe else 1
+        n_shared = 1 if use_moe else 0
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     config = HollowStoneMindConfig(
@@ -187,12 +228,32 @@ def build_model(args):
         num_hidden_layers=args.num_hidden_layers,
         use_moe=use_moe,
         num_experts_per_tok=args.num_experts_per_tok,
-        n_routed_experts=n_routed if n_routed > 0 else 4,
+        n_routed_experts=n_routed if n_routed > 0 else (4 if use_moe else 0),
         n_shared_experts=n_shared,
     )
     model = HollowStoneMindForCausalLM(config)
 
-    model.load_state_dict(normalized_state_dict, strict=True)
+    missing, unexpected = model.load_state_dict(normalized_state_dict, strict=False)
+    if missing:
+        print(f"[WARN] Missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+    # LoRA support
+    if getattr(args, "lora_path", None):
+        adapted = apply_lora(
+            model,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            target_modules=args.lora_target_modules,
+        )
+        if not adapted:
+            raise ValueError(f"No modules matched for LoRA injection with target_modules={args.lora_target_modules!r}")
+        load_lora(model, args.lora_path)
+        print(f"[INFO] LoRA loaded from {args.lora_path}, modules: {', '.join(adapted)}")
+        # merge for faster inference
+        model = merge_lora(model)
+        print("[INFO] LoRA merged into base model for inference.")
 
     dtype = resolve_dtype(args.device, args.dtype)
     model = model.to(args.device)
@@ -231,6 +292,20 @@ def format_prompt_qa(messages):
     return "\n".join(parts)
 
 
+def resolve_prompt_format(tokenizer, args):
+    if args.prompt_format != "auto":
+        return args.prompt_format
+
+    model_name = os.path.basename(args.model_path).lower()
+    if any(tag in model_name for tag in ("sft", "lora", "dpo")):
+        return "chat_template"
+
+    if getattr(tokenizer, "chat_template", None):
+        return "chat_template"
+
+    return "qa"
+
+
 def format_prompt(tokenizer, messages, prompt_format):
     if prompt_format == "chat_template":
         return tokenizer.apply_chat_template(
@@ -244,7 +319,8 @@ def format_prompt(tokenizer, messages, prompt_format):
 
 
 def generate_reply(tokenizer, model, messages, args):
-    prompt_text = format_prompt(tokenizer, messages, args.prompt_format)
+    prompt_format = resolve_prompt_format(tokenizer, args)
+    prompt_text = format_prompt(tokenizer, messages, prompt_format)
     inputs = tokenizer(prompt_text, return_tensors="pt").to(args.device)
 
     with torch.inference_mode():
@@ -277,6 +353,7 @@ def run_single_prompt(tokenizer, model, args):
 
 def run_interactive_chat(tokenizer, model, args):
     print("HollowStoneMind CLI")
+    print(f"prompt_format={resolve_prompt_format(tokenizer, args)}")
     print("输入内容开始对话，输入 /clear 清空上下文，输入 /exit 退出。")
 
     messages = []
